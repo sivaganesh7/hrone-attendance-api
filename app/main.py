@@ -1114,9 +1114,279 @@ def late_leaderboard(
     return {"month": month, "items": items}
 
 
+def build_department_trend_pipeline(department: str, from_date: str, to_date: str):
+    from_d = datetime.strptime(from_date, "%Y-%m-%d").date()
+    to_d = datetime.strptime(to_date, "%Y-%m-%d").date()
+    num_days = (to_d - from_d).days + 1
+    from_dt = datetime(from_d.year, from_d.month, from_d.day, tzinfo=timezone.utc)
+
+    return [
+        {"$match": {"department": department}},
+        {
+            "$group": {
+                "_id": "$department",
+                "employees": {
+                    "$push": {
+                        "emp_code": "$emp_code",
+                        "joined_on": "$joined_on",
+                    }
+                },
+                "emp_codes": {"$push": "$emp_code"},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"codes": "$emp_codes"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$in": ["$emp_code", "$$codes"]},
+                                    {"$gte": ["$date", from_date]},
+                                    {"$lte": ["$date", to_date]},
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "all_logs",
+            }
+        },
+        {
+            "$project": {
+                "employees": 1,
+                "all_logs": 1,
+                "dates": {
+                    "$map": {
+                        "input": {"$range": [0, num_days]},
+                        "as": "offset",
+                        "in": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d",
+                                "date": {
+                                    "$dateAdd": {
+                                        "startDate": from_dt,
+                                        "unit": "day",
+                                        "amount": "$$offset",
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        {"$unwind": "$dates"},
+        {
+            "$project": {
+                "date": "$dates",
+                "date_obj": {"$dateFromString": {"dateString": "$dates"}},
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$employees",
+                            "as": "emp",
+                            "cond": {"$lte": ["$$emp.joined_on", "$dates"]},
+                        }
+                    }
+                },
+                "day_logs": {
+                    "$filter": {
+                        "input": "$all_logs",
+                        "as": "log",
+                        "cond": {"$eq": ["$$log.date", "$dates"]},
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "date": 1,
+                "is_working_day": {
+                    "$lte": [{"$isoDayOfWeek": "$date_obj"}, 5]
+                },
+                "headcount": 1,
+                "present_count": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$day_logs",
+                            "as": "log",
+                            "in": {
+                                "$cond": [
+                                    {"$in": ["$$log.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$cond": [{"$eq": ["$$log.half_day", True]}, 0.5, 1.0]},
+                                    0.0,
+                                ]
+                            },
+                        }
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$day_logs",
+                            "as": "log",
+                            "in": {
+                                "$cond": [
+                                    {"$gt": ["$$log.late_minutes", 0]},
+                                    1,
+                                    0,
+                                ]
+                            },
+                        }
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": {
+                    "$cond": [
+                        {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None,
+                    ]
+                },
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"date": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {
+                            "documents": [-6, "current"],
+                        },
+                    }
+                },
+            }
+        },
+        {"$sort": {"date": 1}},
+    ]
+
+
+def fallback_department_trend(department: str, from_date: str, to_date: str):
+    emps = list(db.employees.find({"department": department}))
+    emp_codes = [e["emp_code"] for e in emps]
+    logs = list(
+        db.attendance_logs.find(
+            {
+                "emp_code": {"$in": emp_codes},
+                "date": {"$gte": from_date, "$lte": to_date},
+            }
+        )
+    )
+    logs_by_date = {}
+    for l in logs:
+        d = l.get("date")
+        if d:
+            logs_by_date.setdefault(d, []).append(l)
+
+    from_d = datetime.strptime(from_date, "%Y-%m-%d").date()
+    to_d = datetime.strptime(to_date, "%Y-%m-%d").date()
+    num_days = (to_d - from_d).days + 1
+
+    rows = []
+    for offset in range(num_days):
+        cur_d = from_d + timedelta(days=offset)
+        cur_d_str = cur_d.strftime("%Y-%m-%d")
+        is_working_day = cur_d.weekday() < 5
+        hc = len([e for e in emps if e.get("joined_on", "") <= cur_d_str])
+
+        day_logs = logs_by_date.get(cur_d_str, [])
+        present_count = 0.0
+        late_count = 0
+        for l in day_logs:
+            st = l.get("status")
+            if st in ("PRESENT", "WFH", "ON_DUTY"):
+                present_count += 0.5 if l.get("half_day") else 1.0
+            if (l.get("late_minutes") or 0) > 0:
+                late_count += 1
+
+        if is_working_day and hc > 0:
+            rate = present_count / hc
+        else:
+            rate = None
+
+        rows.append({
+            "date": cur_d_str,
+            "is_working_day": is_working_day,
+            "headcount": hc,
+            "present_count": present_count,
+            "late_count": late_count,
+            "attendance_rate": rate,
+        })
+
+    for i, r in enumerate(rows):
+        start_idx = max(0, i - 6)
+        rates_in_window = [
+            rows[j]["attendance_rate"]
+            for j in range(start_idx, i + 1)
+            if rows[j]["attendance_rate"] is not None
+        ]
+        if rates_in_window:
+            r["moving_avg_7d"] = sum(rates_in_window) / len(rates_in_window)
+        else:
+            r["moving_avg_7d"] = None
+
+    return rows
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str = Path(...),
+    from_date: str = Query(..., alias="from", pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    to_date: str = Query(..., alias="to", pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+):
+    try:
+        from_d = datetime.strptime(from_date, "%Y-%m-%d").date()
+        to_d = datetime.strptime(to_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Invalid date format, expected YYYY-MM-DD")
+
+    if to_d < from_d:
+        raise HTTPException(status_code=422, detail="'to' date must not be earlier than 'from' date")
+
+    num_days = (to_d - from_d).days + 1
+    if num_days > 92:
+        raise HTTPException(status_code=422, detail="Date range exceeds 92 days limit")
+
+    dept_emp = db.employees.find_one({"department": department})
+    if not dept_emp:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    pipeline = build_department_trend_pipeline(department, from_date, to_date)
+    try:
+        results = list(db.employees.aggregate(pipeline))
+    except NotImplementedError:
+        results = fallback_department_trend(department, from_date, to_date)
+
+    items = []
+    for doc in results:
+        items.append({
+            "date": doc["date"],
+            "is_working_day": bool(doc["is_working_day"]),
+            "headcount": int(doc["headcount"]),
+            "present_count": round_half_up(doc.get("present_count", 0.0), 2),
+            "late_count": int(doc.get("late_count", 0)),
+            "attendance_rate": round_half_up(doc.get("attendance_rate"), 4),
+            "moving_avg_7d": round_half_up(doc.get("moving_avg_7d"), 4),
+        })
+
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+
 
