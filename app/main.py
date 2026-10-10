@@ -29,13 +29,22 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-# --------------------------------------------------------------------------- #
 # Domain Helpers (Rules R1 - R8)
-# --------------------------------------------------------------------------- #
+def _normalize_instant_utc(dt: datetime) -> datetime:
+    """Ensures instant is UTC timezone-aware and truncated to whole seconds (R1)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.replace(microsecond=0)
+
+
+def _parse_time_hm(time_str: str) -> tuple[int, int]:
+    """Parses 'HH:MM' into (hour, minute) integers."""
+    h, m = time_str.split(":")
+    return int(h), int(m)
+
+
 def round_half_up(value: Optional[float | Decimal], decimals: int = 2) -> Optional[float]:
-    """
-    R8: Rounds numbers using standard half-up rounding (not round-half-to-even/banker's).
-    """
+    """R8: Rounds numbers using standard half-up rounding (not round-half-to-even/banker's)."""
     if value is None or isinstance(value, bool):
         return None
     d = Decimal(str(value)) if not isinstance(value, Decimal) else value
@@ -51,20 +60,15 @@ def to_epoch_ms(val: Any) -> Optional[int]:
     if val is None or isinstance(val, bool):
         return None
     if isinstance(val, datetime):
-        if val.tzinfo is None:
-            val = val.replace(tzinfo=timezone.utc)
-        val = val.replace(microsecond=0)
+        val = _normalize_instant_utc(val)
         return int(val.timestamp()) * 1000
     if isinstance(val, (int, float)):
-        # Truncate to whole seconds (ms // 1000 * 1000)
         return (int(val) // 1000) * 1000
     return None
 
 
 def make_json_safe(val: Any) -> Any:
-    """
-    Recursively converts BSON datetimes and non-primitive objects to JSON-safe primitives.
-    """
+    """Recursively converts BSON datetimes and non-primitive objects to JSON-safe primitives."""
     if isinstance(val, dict):
         return {str(k): make_json_safe(v) for k, v in val.items()}
     elif isinstance(val, list):
@@ -83,15 +87,13 @@ def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str
     a punch-in whose IST time is earlier than shift_end belongs to the shift
     that started the previous day.
     """
-    if punch_in_utc.tzinfo is None:
-        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
-    punch_in_utc = punch_in_utc.replace(microsecond=0)
+    punch_in_utc = _normalize_instant_utc(punch_in_utc)
     punch_in_ist = punch_in_utc.astimezone(IST)
-    start_h, start_m = map(int, shift_start.split(":"))
-    end_h, end_m = map(int, shift_end.split(":"))
-    is_overnight = (end_h, end_m) <= (start_h, start_m)
+    start_hm = _parse_time_hm(shift_start)
+    end_hm = _parse_time_hm(shift_end)
+    is_overnight = end_hm <= start_hm
 
-    if is_overnight and (punch_in_ist.hour, punch_in_ist.minute, punch_in_ist.second) < (end_h, end_m, 0):
+    if is_overnight and (punch_in_ist.hour, punch_in_ist.minute, punch_in_ist.second) < (end_hm[0], end_hm[1], 0):
         return (punch_in_ist - timedelta(days=1)).strftime("%Y-%m-%d")
     return punch_in_ist.strftime("%Y-%m-%d")
 
@@ -102,11 +104,8 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, date_str: str
     Late only if punch-in is strictly more than 10:00 (600s) after shift_start.
     When late: whole minutes (floor) elapsed since shift_start. Otherwise 0.
     """
-    if punch_in_utc.tzinfo is None:
-        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
-    punch_in_utc = punch_in_utc.replace(microsecond=0)
-
-    start_h, start_m = map(int, shift_start.split(":"))
+    punch_in_utc = _normalize_instant_utc(punch_in_utc)
+    start_h, start_m = _parse_time_hm(shift_start)
     y, m, d = map(int, date_str.split("-"))
     shift_start_ist = datetime(y, m, d, start_h, start_m, 0, tzinfo=IST)
     shift_start_utc = shift_start_ist.astimezone(timezone.utc)
@@ -118,15 +117,9 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, date_str: str
 
 
 def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float:
-    """
-    R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up.
-    """
-    if punch_in_utc.tzinfo is None:
-        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
-    if punch_out_utc.tzinfo is None:
-        punch_out_utc = punch_out_utc.replace(tzinfo=timezone.utc)
-    punch_in_utc = punch_in_utc.replace(microsecond=0)
-    punch_out_utc = punch_out_utc.replace(microsecond=0)
+    """R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up."""
+    punch_in_utc = _normalize_instant_utc(punch_in_utc)
+    punch_out_utc = _normalize_instant_utc(punch_out_utc)
 
     elapsed_seconds = int((punch_out_utc - punch_in_utc).total_seconds())
     hours = Decimal(elapsed_seconds) / Decimal(3600)
@@ -138,16 +131,13 @@ def compute_overtime(punch_out_utc: datetime, shift_start: str, shift_end: str, 
     R3: Whole minutes (floor) from shift_end to punch_out, counted only if >= 30; otherwise 0.
     For overnight shifts, shift_end is on the following calendar day.
     """
-    if punch_out_utc.tzinfo is None:
-        punch_out_utc = punch_out_utc.replace(tzinfo=timezone.utc)
-    punch_out_utc = punch_out_utc.replace(microsecond=0)
-
-    start_h, start_m = map(int, shift_start.split(":"))
-    end_h, end_m = map(int, shift_end.split(":"))
+    punch_out_utc = _normalize_instant_utc(punch_out_utc)
+    start_hm = _parse_time_hm(shift_start)
+    end_h, end_m = _parse_time_hm(shift_end)
     y, m, d = map(int, date_str.split("-"))
     att_date = datetime(y, m, d, tzinfo=IST)
 
-    if (end_h, end_m) <= (start_h, start_m):
+    if (end_h, end_m) <= start_hm:
         shift_end_ist = (att_date + timedelta(days=1)).replace(hour=end_h, minute=end_m, second=0, microsecond=0)
     else:
         shift_end_ist = att_date.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
@@ -169,9 +159,7 @@ def compute_half_day(work_hours: Optional[float]) -> bool:
     return work_hours < 4.50
 
 
-# --------------------------------------------------------------------------- #
 # Database Serializers
-# --------------------------------------------------------------------------- #
 def serialize_employee(doc: dict) -> dict:
     return {
         "emp_code": doc["emp_code"],
@@ -230,9 +218,7 @@ def serialize_attendance(doc: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
 # Pydantic Request & Response Models (openapi.yaml schemas)
-# --------------------------------------------------------------------------- #
 EpochMillisField = Annotated[int, Field(ge=100000000000, le=4102444800000, strict=True)]
 
 
@@ -275,9 +261,7 @@ class RegularizeRequest(BaseModel):
     regularized_by: str = Field(..., min_length=1, max_length=50)
 
 
-# --------------------------------------------------------------------------- #
 # Startup & Index Management
-# --------------------------------------------------------------------------- #
 def ensure_indexes(db_instance):
     """
     Idempotently creates required indexes for the collections.
@@ -357,9 +341,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
-# --------------------------------------------------------------------------- #
 # Endpoints
-# --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
     try:
@@ -463,10 +445,7 @@ def punch_out(body: PunchOutRequest):
             raise HTTPException(status_code=422, detail="punched_at cannot be at or before punch_in")
         raise HTTPException(status_code=404, detail="No punch-in found")
 
-    punch_in_utc = record["punch_in"]
-    if punch_in_utc.tzinfo is None:
-        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
-    punch_in_utc = punch_in_utc.replace(microsecond=0)
+    punch_in_utc = _normalize_instant_utc(record["punch_in"])
 
     if punch_out_utc <= punch_in_utc:
         raise HTTPException(status_code=422, detail="punched_at cannot be at or before punch_in")
@@ -582,16 +561,8 @@ def regularize_attendance(
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
     old_status = record["status"]
-    old_punch_in = record.get("punch_in")
-    old_punch_out = record.get("punch_out")
-    if old_punch_in is not None and old_punch_in.tzinfo is None:
-        old_punch_in = old_punch_in.replace(tzinfo=timezone.utc)
-    if old_punch_in is not None:
-        old_punch_in = old_punch_in.replace(microsecond=0)
-    if old_punch_out is not None and old_punch_out.tzinfo is None:
-        old_punch_out = old_punch_out.replace(tzinfo=timezone.utc)
-    if old_punch_out is not None:
-        old_punch_out = old_punch_out.replace(microsecond=0)
+    old_punch_in = _normalize_instant_utc(record["punch_in"]) if record.get("punch_in") is not None else None
+    old_punch_out = _normalize_instant_utc(record["punch_out"]) if record.get("punch_out") is not None else None
 
     old_work_hours = record.get("work_hours")
     old_late_minutes = 0 if record.get("late_minutes") is None else int(record["late_minutes"])
