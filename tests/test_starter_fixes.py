@@ -110,22 +110,8 @@ def test_r4_and_r5_work_hours_and_half_day():
 # Integration Tests: Endpoints & Validation
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
-def mock_db():
-    mock_client = mongomock.MongoClient(tz_aware=True)
-    mock_database = mock_client["attendance_db"]
-    # Wire mock db into main module
-    orig_client = main_module.client
-    orig_db = main_module.db
-    main_module.client = mock_client
-    main_module.db = mock_database
-
-    # Create indexes in mock
-    main_module.ensure_indexes(mock_database)
-
-    yield mock_database
-
-    main_module.client = orig_client
-    main_module.db = orig_db
+def mock_db(db_fixture):
+    return db_fixture
 
 
 def test_health_check_ok():

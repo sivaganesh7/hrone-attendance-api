@@ -8,20 +8,8 @@ from app.main import app
 
 
 @pytest.fixture(autouse=True)
-def mock_db():
-    mock_client = mongomock.MongoClient(tz_aware=True)
-    mock_database = mock_client["attendance_db"]
-    orig_client = main_module.client
-    orig_db = main_module.db
-    main_module.client = mock_client
-    main_module.db = mock_database
-
-    main_module.ensure_indexes(mock_database)
-
-    yield mock_database
-
-    main_module.client = orig_client
-    main_module.db = orig_db
+def mock_db(db_fixture):
+    return db_fixture
 
 
 def test_leaderboard_month_and_limit_validation_422():

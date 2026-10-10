@@ -9,20 +9,8 @@ from app.main import app, IST
 
 
 @pytest.fixture(autouse=True)
-def mock_db():
-    mock_client = mongomock.MongoClient(tz_aware=True)
-    mock_database = mock_client["attendance_db"]
-    orig_client = main_module.client
-    orig_db = main_module.db
-    main_module.client = mock_client
-    main_module.db = mock_database
-
-    main_module.ensure_indexes(mock_database)
-
-    yield mock_database
-
-    main_module.client = orig_client
-    main_module.db = orig_db
+def mock_db(db_fixture):
+    return db_fixture
 
 
 def test_patch_unknown_employee_404():
@@ -436,12 +424,12 @@ def test_patch_concurrency_conflict_409(monkeypatch):
     in_ms = 1783310280000
     client.post("/attendance/punch-in", json={"emp_code": "EMP0001", "punched_at": in_ms})
 
-    # Synchronize both threads so they read the exact same initial document state
-    orig_find_one = main_module.db.attendance_logs.find_one
+    import pymongo.collection
+    orig_find_one = pymongo.collection.Collection.find_one
     barrier = threading.Barrier(2)
 
-    def find_one_synced(filter_doc, *args, **kwargs):
-        res = orig_find_one(filter_doc, *args, **kwargs)
+    def find_one_synced(self, filter_doc, *args, **kwargs):
+        res = orig_find_one(self, filter_doc, *args, **kwargs)
         if isinstance(filter_doc, dict) and filter_doc.get("date") == "2026-07-06":
             try:
                 barrier.wait(timeout=2)
@@ -449,7 +437,7 @@ def test_patch_concurrency_conflict_409(monkeypatch):
                 pass
         return res
 
-    monkeypatch.setattr(main_module.db.attendance_logs, "find_one", find_one_synced)
+    monkeypatch.setattr(pymongo.collection.Collection, "find_one", find_one_synced)
 
     def attempt_patch(idx):
         return client.patch(

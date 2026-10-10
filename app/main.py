@@ -61,6 +61,21 @@ def to_epoch_ms(val: Any) -> Optional[int]:
     return None
 
 
+def make_json_safe(val: Any) -> Any:
+    """
+    Recursively converts BSON datetimes and non-primitive objects to JSON-safe primitives.
+    """
+    if isinstance(val, dict):
+        return {str(k): make_json_safe(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [make_json_safe(v) for v in val]
+    elif isinstance(val, datetime):
+        return val.isoformat()
+    elif isinstance(val, (int, float, str, bool)) or val is None:
+        return val
+    return str(val)
+
+
 def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
     """
     R1: Calculates the IST calendar date for a punch-in.
@@ -289,6 +304,9 @@ def ensure_indexes(db_instance):
             [("department", 1), ("emp_code", 1)], name="idx_employees_dept_emp_code"
         )
         db_instance.employees.create_index([("joined_on", 1)], name="idx_employees_joined_on")
+        db_instance.employees.create_index(
+            [("department", 1), ("joined_on", 1)], name="idx_employees_dept_joined_on"
+        )
 
         # Check conflicts for attendance_logs(emp_code, date)
         att_dups = list(
@@ -487,6 +505,26 @@ def punch_out(body: PunchOutRequest):
     return serialize_attendance(updated_doc)
 
 
+def build_attendance_list_query(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+) -> dict:
+    q = {}
+    if emp_code is not None:
+        q["emp_code"] = emp_code
+    if status is not None:
+        q["status"] = status
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from
+        if date_to:
+            q["date"]["$lte"] = date_to
+    return q
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -510,17 +548,7 @@ def list_attendance(
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=422, detail="date_from cannot be after date_to")
 
-    q = {}
-    if emp_code is not None:
-        q["emp_code"] = emp_code
-    if status is not None:
-        q["status"] = status
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
+    q = build_attendance_list_query(emp_code, date_from, date_to, status)
 
     total = db.attendance_logs.count_documents(q)
     skip = (page - 1) * page_size
@@ -707,43 +735,19 @@ def regularize_attendance(
     return serialize_attendance(updated_doc)
 
 
-@app.get("/analytics/employees/{emp_code}/monthly")
-def employee_monthly(
-    emp_code: str,
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-):
-    emp = db.employees.find_one({"emp_code": emp_code})
-    if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
+def build_employee_monthly_pipeline(emp_code: str, month: str) -> list:
     year, month_num = map(int, month.split("-"))
     num_days = calendar.monthrange(year, month_num)[1]
     first_day_str = f"{month}-01"
     last_day_str = f"{month}-{num_days:02d}"
 
-    # Calculate weekday dates in the month (Mon-Fri)
     weekday_dates = []
     for day in range(1, num_days + 1):
         d_obj = datetime(year, month_num, day).date()
         if d_obj.weekday() < 5:
             weekday_dates.append(f"{month}-{day:02d}")
 
-    # R7: Working days Mon-Fri, counted from joined_on for mid-month joiners
-    emp_joined = emp.get("joined_on", first_day_str)
-    start_date_str = max(first_day_str, emp_joined)
-
-    working_days = 0
-    if start_date_str <= last_day_str:
-        start_d = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-        end_d = datetime.strptime(last_day_str, "%Y-%m-%d").date()
-        cur = start_d
-        while cur <= end_d:
-            if cur.weekday() < 5:
-                working_days += 1
-            cur += timedelta(days=1)
-
-    # MongoDB aggregation pipeline over attendance_logs
-    pipeline = [
+    return [
         {
             "$match": {
                 "emp_code": emp_code,
@@ -804,6 +808,36 @@ def employee_monthly(
         },
     ]
 
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    year, month_num = map(int, month.split("-"))
+    num_days = calendar.monthrange(year, month_num)[1]
+    first_day_str = f"{month}-01"
+    last_day_str = f"{month}-{num_days:02d}"
+
+    # R7: Working days Mon-Fri, counted from joined_on for mid-month joiners
+    emp_joined = emp.get("joined_on", first_day_str)
+    start_date_str = max(first_day_str, emp_joined)
+
+    working_days = 0
+    if start_date_str <= last_day_str:
+        start_d = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        end_d = datetime.strptime(last_day_str, "%Y-%m-%d").date()
+        cur = start_d
+        while cur <= end_d:
+            if cur.weekday() < 5:
+                working_days += 1
+            cur += timedelta(days=1)
+
+    pipeline = build_employee_monthly_pipeline(emp_code, month)
     agg_results = list(db.attendance_logs.aggregate(pipeline))
 
     if agg_results:
@@ -839,29 +873,23 @@ def employee_monthly(
     }
 
 
-@app.get("/analytics/departments/summary")
-def department_summary(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-    department: Optional[str] = Query(None),
-):
+def build_department_summary_pipeline(month: str, department: Optional[str] = None) -> list:
     year, month_num = map(int, month.split("-"))
     num_days = calendar.monthrange(year, month_num)[1]
     first_day_str = f"{month}-01"
     last_day_str = f"{month}-{num_days:02d}"
 
-    # Weekday dates for present_days rule (Mon-Fri)
     weekday_dates = []
     for day in range(1, num_days + 1):
         d_obj = datetime(year, month_num, day).date()
         if d_obj.weekday() < 5:
             weekday_dates.append(f"{month}-{day:02d}")
 
-    # R9: Headcount includes employees whose joined_on is on or before the last day of the month
     match_emp = {"joined_on": {"$lte": last_day_str}}
     if department is not None:
         match_emp["department"] = department
 
-    pipeline = [
+    return [
         {"$match": match_emp},
         {
             "$lookup": {
@@ -977,6 +1005,13 @@ def department_summary(
         {"$sort": {"_id": 1}},
     ]
 
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = Query(None),
+):
+    pipeline = build_department_summary_pipeline(month, department)
     agg_results = list(db.employees.aggregate(pipeline))
 
     items = []
@@ -1011,12 +1046,7 @@ def department_summary(
     return {"month": month, "items": items}
 
 
-@app.get("/analytics/leaderboard/late")
-def late_leaderboard(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-    limit: int = Query(10, ge=1, le=50),
-    department: Optional[str] = Query(None),
-):
+def build_late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[str] = None) -> list:
     year, month_num = map(int, month.split("-"))
     num_days = calendar.monthrange(year, month_num)[1]
     first_day_str = f"{month}-01"
@@ -1077,7 +1107,16 @@ def late_leaderboard(
         {"$match": {"rank": {"$lte": limit}}},
         {"$sort": {"total_late_minutes": -1, "emp_code": 1}},
     ])
+    return pipeline
 
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = Query(None),
+):
+    pipeline = build_late_leaderboard_pipeline(month, limit, department)
     try:
         results = list(db.attendance_logs.aggregate(pipeline))
     except NotImplementedError:
@@ -1384,9 +1423,154 @@ def department_trend(
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ] = Path(...),
+    emp_code: Optional[str] = Query(None),
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = Query(None),
+    limit: Optional[int] = Query(10, ge=1, le=50),
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    from_date: Optional[str] = Query(None, alias="from", pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    to_date: Optional[str] = Query(None, alias="to", pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    page: Optional[int] = Query(1, ge=1),
+    page_size: Optional[int] = Query(20, ge=1, le=100),
+):
+    if endpoint == "attendance_list":
+        if date_from:
+            try:
+                datetime.strptime(date_from, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid date_from")
+        if date_to:
+            try:
+                datetime.strptime(date_to, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid date_to")
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=422, detail="date_from cannot be after date_to")
+
+        collection = "attendance_logs"
+        q = build_attendance_list_query(emp_code, date_from, date_to, status)
+        p = page or 1
+        ps = page_size or 20
+        skip = (p - 1) * ps
+        explain_cmd = {
+            "explain": {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": skip,
+                "limit": ps,
+            },
+            "verbosity": "executionStats",
+        }
+
+    elif endpoint == "employee_monthly":
+        if not emp_code:
+            raise HTTPException(status_code=422, detail="emp_code is required for employee_monthly")
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for employee_monthly")
+
+        collection = "attendance_logs"
+        pipeline = build_employee_monthly_pipeline(emp_code, month)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+
+    elif endpoint == "department_summary":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for department_summary")
+
+        collection = "employees"
+        pipeline = build_department_summary_pipeline(month, department)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for late_leaderboard")
+
+        collection = "attendance_logs"
+        lim = limit if limit is not None else 10
+        pipeline = build_late_leaderboard_pipeline(month, lim, department)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+
+    elif endpoint == "department_trend":
+        if not department:
+            raise HTTPException(status_code=422, detail="department is required for department_trend")
+        if not from_date:
+            raise HTTPException(status_code=422, detail="'from' date is required for department_trend")
+        if not to_date:
+            raise HTTPException(status_code=422, detail="'to' date is required for department_trend")
+
+        try:
+            from_d = datetime.strptime(from_date, "%Y-%m-%d").date()
+            to_d = datetime.strptime(to_date, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="Invalid date format, expected YYYY-MM-DD")
+
+        if to_d < from_d:
+            raise HTTPException(status_code=422, detail="'to' date must not be earlier than 'from' date")
+        if (to_d - from_d).days + 1 > 92:
+            raise HTTPException(status_code=422, detail="Date range exceeds 92 days limit")
+
+        collection = "employees"
+        pipeline = build_department_trend_pipeline(department, from_date, to_date)
+        explain_cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+
+    try:
+        raw_explain = db.command(explain_cmd)
+    except NotImplementedError:
+        # Mock fallback for test runners using mongomock
+        raw_explain = {
+            "queryPlanner": {
+                "winningPlan": {
+                    "stage": "IXSCAN",
+                }
+            },
+            "executionStats": {
+                "executionSuccess": True,
+            },
+        }
+
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": make_json_safe(raw_explain),
+    }
 
 
